@@ -1,7 +1,5 @@
 import io
-import re
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -15,6 +13,7 @@ MONTHS_SE = {
 
 
 def parse_swedish_number(value):
+    """Tolkar svenska tal, t.ex. '1 234,56' -> 1234.56."""
     if pd.isna(value):
         return 0.0
     if isinstance(value, (int, float)):
@@ -28,76 +27,78 @@ def parse_swedish_number(value):
 
 
 def read_qt_csv(uploaded_file):
-    # QT exporten är normalt UTF-8 med kommatecken och svenska decimalkomman.
+    """
+    Läser QT CSV-export.
+
+    Viktigt: Vi tar med ALLA rader där Enhet = kWh.
+    Vi filtrerar alltså INTE på att mätarnamnet slutar på EL, eftersom vissa hus
+    kan ha förbrukning både på t.ex. 24 och 24EL. Båda ska debiteras.
+    """
     raw = uploaded_file.getvalue()
+    text = None
     for encoding in ["utf-8-sig", "utf-8", "latin1"]:
         try:
             text = raw.decode(encoding)
             break
         except UnicodeDecodeError:
             continue
-    else:
+    if text is None:
         text = raw.decode("utf-8", errors="ignore")
 
     df = pd.read_csv(io.StringIO(text), sep=",", dtype=str)
+
     required = {"Objekt-ID", "Mätare", "Startdatum", "Slutdatum", "Förbrukning", "Enhet"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Saknade kolumner: {', '.join(sorted(missing))}")
 
+    df["Objekt-ID"] = df["Objekt-ID"].astype(str).str.strip()
+    df["Mätare"] = df["Mätare"].astype(str).str.strip()
+    df["Enhet"] = df["Enhet"].astype(str).str.strip()
     df["Förbrukning_kWh"] = df["Förbrukning"].apply(parse_swedish_number)
     df["Startdatum_dt"] = pd.to_datetime(df["Startdatum"], errors="coerce")
     df["Slutdatum_dt"] = pd.to_datetime(df["Slutdatum"], errors="coerce")
 
-    # QT-filen innehåller normalt två rader per objekt, t.ex. mätare "26" och "26EL".
-    # Oftast ligger förbrukningen på "EL"-raden, men vissa objekt kan ha värdet på den andra raden.
-    # Därför väljer vi EN rad per objekt och period: den med högst förbrukning.
-    # Det undviker både dubbelräkning och att t.ex. 8K blir 0 när 26EL är 0 men 26 har värdet.
-    el_rows = df[df["Enhet"].astype(str).str.lower().eq("kwh")].copy()
-    el_rows = (
-        el_rows.sort_values("Förbrukning_kWh", ascending=False)
-        .drop_duplicates(subset=["Objekt-ID", "Startdatum", "Slutdatum"], keep="first")
-        .copy()
-    )
-    el_rows["Filnamn"] = uploaded_file.name
+    # Ta med alla kWh-rader. Detta är hela poängen med v2.
+    rows = df[df["Enhet"].str.lower().eq("kwh")].copy()
+    rows["Filnamn"] = uploaded_file.name
 
-    first_date = el_rows["Startdatum_dt"].dropna().min()
+    first_date = rows["Startdatum_dt"].dropna().min()
     if pd.isna(first_date):
-        # fallback från filnamn om datum saknas
         first_date = datetime.today()
+
     month_key = f"{first_date.year}-{first_date.month:02d}"
     month_label = f"{MONTHS_SE[first_date.month]} {first_date.year}"
-    el_rows["Månad"] = month_label
-    el_rows["MånadNyckel"] = month_key
-    return el_rows
+    rows["MånadNyckel"] = month_key
+    rows["Månad"] = month_label
+
+    return rows
 
 
-def to_excel(monthly_result, summary_result, details_result):
+def to_excel(monthly_result, summary_result, details_result, file_check_result):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary_result.to_excel(writer, sheet_name="Sammanfattning", index=False)
         monthly_result.to_excel(writer, sheet_name="Per månad", index=False)
         details_result.to_excel(writer, sheet_name="Detaljer", index=False)
+        file_check_result.to_excel(writer, sheet_name="Kontroll per fil", index=False)
 
-        # Enkel formatering
         for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
             ws.freeze_panes = "A2"
             for col in ws.columns:
-                max_len = 0
                 col_letter = col[0].column_letter
-                for cell in col:
-                    try:
-                        max_len = max(max_len, len(str(cell.value)))
-                    except Exception:
-                        pass
-                ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
+                max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 45)
     output.seek(0)
     return output
 
 
 st.title("QT Debiteringsunderlag")
-st.write("Ladda upp en eller flera CSV-filer från QT Systems, ange elpris per månad och exportera färdigt underlag.")
+st.write(
+    "Ladda upp en eller flera CSV-filer från QT Systems. Appen summerar alla rader där Enhet = kWh "
+    "per fastighet och månad. Ange elpris per månad och exportera Excel-underlag."
+)
 
 uploaded_files = st.file_uploader(
     "Dra in CSV-filer här",
@@ -111,7 +112,15 @@ if not uploaded_files:
 
 all_rows = []
 errors = []
+seen_files = set()
+
 for file in uploaded_files:
+    # En enkel varning mot exakt samma filnamn två gånger.
+    if file.name in seen_files:
+        st.warning(f"Filen verkar uppladdad flera gånger och ignoreras: {file.name}")
+        continue
+    seen_files.add(file.name)
+
     try:
         all_rows.append(read_qt_csv(file))
     except Exception as exc:
@@ -124,6 +133,13 @@ if not all_rows:
     st.stop()
 
 details = pd.concat(all_rows, ignore_index=True)
+
+# Kontroll per fil så man direkt ser totalsumma från varje QT-export.
+file_check = (
+    details.groupby(["Filnamn", "MånadNyckel", "Månad"], as_index=False)
+    .agg(Antal_rader=("Förbrukning_kWh", "size"), Total_kWh=("Förbrukning_kWh", "sum"))
+    .sort_values(["MånadNyckel", "Filnamn"])
+)
 
 months = (
     details[["MånadNyckel", "Månad"]]
@@ -151,8 +167,8 @@ monthly = (
     details.groupby(["Objekt-ID", "MånadNyckel", "Månad"], as_index=False)
     .agg({"Förbrukning_kWh": "sum", "Pris kr/kWh": "max", "Kostnad kr": "sum"})
     .sort_values(["Objekt-ID", "MånadNyckel"])
+    .rename(columns={"Objekt-ID": "Fastighet", "Förbrukning_kWh": "kWh"})
 )
-monthly = monthly.rename(columns={"Objekt-ID": "Fastighet", "Förbrukning_kWh": "kWh"})
 
 summary = (
     monthly.groupby("Fastighet", as_index=False)
@@ -160,12 +176,17 @@ summary = (
     .sort_values("Fastighet")
 )
 
-# Avrundning för visning/export
+# Avrundade kopior för visning och export. Rådata behåller tre decimaler för kWh.
 monthly_display = monthly.copy()
 summary_display = summary.copy()
 details_display = details.copy()
-for frame in [monthly_display, summary_display, details_display]:
-    for col in ["kWh", "Förbrukning_kWh", "Pris kr/kWh", "Kostnad kr"]:
+file_check_display = file_check.copy()
+
+for frame in [monthly_display, summary_display, details_display, file_check_display]:
+    for col in ["kWh", "Förbrukning_kWh", "Total_kWh"]:
+        if col in frame.columns:
+            frame[col] = frame[col].round(3)
+    for col in ["Pris kr/kWh", "Kostnad kr"]:
         if col in frame.columns:
             frame[col] = frame[col].round(2)
 
@@ -175,14 +196,16 @@ st.dataframe(summary_display, use_container_width=True, hide_index=True)
 st.subheader("3. Per månad")
 st.dataframe(monthly_display, use_container_width=True, hide_index=True)
 
-excel_file = to_excel(monthly_display, summary_display, details_display)
-file_label = "debiteringsunderlag_qt.xlsx"
-st.download_button(
-    "Ladda ner Excel-underlag",
-    data=excel_file,
-    file_name=file_label,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+with st.expander("Kontroll per fil"):
+    st.dataframe(file_check_display, use_container_width=True, hide_index=True)
 
 with st.expander("Visa importerade rader"):
     st.dataframe(details_display, use_container_width=True, hide_index=True)
+
+excel_file = to_excel(monthly_display, summary_display, details_display, file_check_display)
+st.download_button(
+    "Ladda ner Excel-underlag",
+    data=excel_file,
+    file_name="debiteringsunderlag_qt.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
