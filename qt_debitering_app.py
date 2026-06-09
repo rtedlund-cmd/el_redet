@@ -49,13 +49,16 @@ def read_qt_csv(uploaded_file):
     df["Startdatum_dt"] = pd.to_datetime(df["Startdatum"], errors="coerce")
     df["Slutdatum_dt"] = pd.to_datetime(df["Slutdatum"], errors="coerce")
 
-    # Undvik dubbelräkning: QT-filen verkar innehålla både mätare '1' och '1EL'.
-    # För ladduttag/motorvärmare är rader med mätare som slutar på EL de relevanta.
-    el_rows = df[df["Mätare"].astype(str).str.endswith("EL", na=False)].copy()
-    if el_rows.empty:
-        el_rows = df.copy()
-
-    el_rows = el_rows[el_rows["Enhet"].astype(str).str.lower().eq("kwh")].copy()
+    # QT-filen innehåller normalt två rader per objekt, t.ex. mätare "26" och "26EL".
+    # Oftast ligger förbrukningen på "EL"-raden, men vissa objekt kan ha värdet på den andra raden.
+    # Därför väljer vi EN rad per objekt och period: den med högst förbrukning.
+    # Det undviker både dubbelräkning och att t.ex. 8K blir 0 när 26EL är 0 men 26 har värdet.
+    el_rows = df[df["Enhet"].astype(str).str.lower().eq("kwh")].copy()
+    el_rows = (
+        el_rows.sort_values("Förbrukning_kWh", ascending=False)
+        .drop_duplicates(subset=["Objekt-ID", "Startdatum", "Slutdatum"], keep="first")
+        .copy()
+    )
     el_rows["Filnamn"] = uploaded_file.name
 
     first_date = el_rows["Startdatum_dt"].dropna().min()
